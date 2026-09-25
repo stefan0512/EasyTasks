@@ -1,5 +1,6 @@
 /**
- * Creates the `task_lists` and `tasks` collections used by EasyTasks.
+ * Creates the `task_lists` and `tasks` collections used by EasyTasks, and adds the
+ * push notification fields to the built-in `users` collection.
  *
  * Usage (needs `npm install pocketbase`):
  *   PB_URL=https://your-server.com:xxxx node setup-collections.mjs <superuser-email> <superuser-password>
@@ -10,6 +11,9 @@
  * `user` and `taskListId` are relations, and a task list is either public or private.
  * The API rules below let everyone read public lists while private lists stay visible
  * to their owner only; tasks inherit that from the list they belong to.
+ *
+ * `PushNotifications` and `PushOverUser` on `users` are read by the hook in
+ * `pb_hooks/notify_new_task.pb.js`, which has to be copied to the server separately.
  */
 import PocketBase from 'pocketbase';
 
@@ -44,6 +48,13 @@ try {
 }
 
 const usersId = (await pb.collections.getOne('users')).id;
+
+// Fields added to the built-in `users` collection: whether the user wants a push
+// notification for new tasks, and their Pushover user key.
+const users = {
+  name: 'users',
+  fields: [{ name: 'PushNotifications', type: 'bool' }, text('PushOverUser')],
+};
 
 const taskLists = {
   name: 'task_lists',
@@ -135,6 +146,9 @@ async function addMissingFields(collection) {
   );
   return existing.id;
 }
+
+// `users` already exists, so it only gets the fields it is missing.
+await addMissingFields(users);
 
 // `task_lists` first: `tasks.taskListId` needs its id for the relation.
 const taskListsId = await create(taskLists);
