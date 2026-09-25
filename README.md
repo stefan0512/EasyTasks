@@ -50,7 +50,9 @@ $env:PB_URL = "https://your-server.com:xxxx"
 node setup-collections.mjs <superuser-email> <superuser-password>
 ```
 
-It creates `task_lists` and `tasks` with the fields and API rules described below.
+It creates `task_lists` and `tasks` with the fields and API rules described below, and
+adds the two push notification fields to `users` (see
+[Push notifications for new tasks](#4-push-notifications-for-new-tasks)).
 Running it again is safe: an existing collection only gets the fields it is missing (for
 example after a field was added to the script); existing fields, rules and records are
 left untouched. To change or remove a field, use the Admin UI or start over with the
@@ -112,8 +114,18 @@ HTTP call is `DELETE /api/collections/<name>` with the superuser token in the
 ## 1. `users` — already there
 
 PocketBase ships with an auth collection named `users`. EasyTasks logs in against it with
-**e-mail and password** (*Settings* page in the app) and needs no changes to it. Make
-sure the identity/password auth method is enabled under *Collections → users → Options*.
+**e-mail and password** (*Settings* page in the app). Make sure the identity/password
+auth method is enabled under *Collections → users → Options*.
+
+For push notifications, `users` gets two extra fields. The setup script adds them; in the
+Admin UI, add them under *Collections → users → Fields*:
+
+| Field               | Type       | Notes                                                    |
+| ------------------- | ---------- | -------------------------------------------------------- |
+| `PushNotifications` | Bool       | Ticked: the user is notified about new tasks.            |
+| `PushOverUser`      | Plain text | The user's Pushover user key. Empty: no notifications.   |
+
+The names are case-sensitive; the notification hook looks them up exactly like this.
 
 Both other collections point at it: EasyTasks stores the id of the logged-in user as the
 owner of every list and task it creates. Without a login, EasyTasks stores its data in
@@ -203,7 +215,45 @@ So a public list is readable by everyone, but only its owner may add, change or 
 its tasks. To let any logged-in user add tasks to a public list, widen Create to
 `@request.auth.id != "" && (taskListId.visibility = "public" || taskListId.user = @request.auth.id)`.
 
-## 4. Things to watch
+## 4. Push notifications for new tasks
+
+Optional. When a task is created, PocketBase itself sends a push notification through
+`https://push.cachat.ch/notify`, using a server-side hook — so the Pushover keys never
+reach the app, and tasks created in any way (app, Admin UI, API) are covered.
+
+Who is notified: every user with **`PushNotifications`** ticked and a
+**`PushOverUser`** key set, except the user who created the task. A task on a
+**private** list only goes to the list's owner — and since only the owner may add tasks
+to their lists, tasks on private lists notify nobody. Users sharing a key get one
+message, not several. The message reads, for example,
+`New task in "Shopping": Milk (by anna@example.com)`.
+
+**Setup:**
+
+1. Add the two fields to `users` (the setup script does this, see
+   [`users`](#1-users--already-there)), then set them per user in the Admin UI.
+2. Copy [`pb_hooks/notify_new_task.pb.js`](pb_hooks/notify_new_task.pb.js) into the
+   `pb_hooks` folder next to PocketBase's `pb_data` folder. With Docker, mount it:
+
+   ```yaml
+   volumes:
+     - ./pb_data:/pb/pb_data
+     - ./pb_hooks:/pb/pb_hooks
+   ```
+
+   PocketBase looks for hooks in `pb_hooks` next to the data folder (`--dir`), so no
+   extra option is needed.
+3. Restart PocketBase; with Docker, `docker compose up -d` (a plain `restart` does not
+   pick up a new volume). Later changes to the file are reloaded automatically.
+
+A failed notification never stops the task from being saved. Failures are logged under
+*Logs* in the Admin UI (`push notify failed` / `push notify error`).
+
+**Keep the keys private.** The default API rules on `users` only let a user read their
+own record, so nobody sees another user's `PushOverUser` key. If you loosened those
+rules, mark `PushOverUser` as *Hidden* in the field options.
+
+## 5. Things to watch
 
 - **Superusers see everything.** Rules don't apply in the Admin UI, so "private" means
   private from other app users, not from the server's administrator.
@@ -215,7 +265,7 @@ its tasks. To let any logged-in user add tasks to a public list, widen Create to
   PocketBase. PocketBase allows requests from any origin by default; if you restricted
   that with the `--origins` option, add the address EasyTasks is served from.
 
-## 5. Check it
+## 6. Check it
 
 1. In EasyTasks, open **Settings** from the menu.
 2. Enter `https://your-server.com:xxxx` as the server URL, plus the e-mail and password
