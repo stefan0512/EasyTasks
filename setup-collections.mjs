@@ -5,15 +5,15 @@
  * Usage (needs `npm install pocketbase`):
  *   PB_URL=https://your-server.com:xxxx node setup-collections.mjs <superuser-email> <superuser-password>
  *
- * Re-running is safe: existing collections only get the fields they are missing;
- * nothing is removed or changed.
+ * Re-running is safe: existing collections only get missing fields and the API
+ * rules declared below; no fields are removed.
  *
  * `user` and `taskListId` are relations, and a task list is either public or private.
  * The API rules below let everyone read public lists while private lists stay visible
  * to their owner only; tasks inherit that from the list they belong to.
  *
- * `PushNotifications` and `PushOverUser` on `users` are read by the hook in
- * `pb_hooks/notify_new_task.pb.js`, which has to be copied to the server separately.
+ * `PushTaskNew`, `PushTaskDone`, `PushTaskChanged`, `PushOnlyAssigned` and `PushOverUser` on `users`
+ * are read by the hooks in `pb_hooks/`, which have to be copied to the server separately.
  */
 import PocketBase from 'pocketbase';
 
@@ -29,10 +29,10 @@ if (!PB_URL || !email || !password) {
 
 const text = (name) => ({ name, type: 'text' });
 
-const relation = (name, collectionId) => ({
+const relation = (name, collectionId, required = true) => ({
   name,
   type: 'relation',
-  required: true,
+  required,
   collectionId,
   maxSelect: 1,
   cascadeDelete: false,
@@ -49,11 +49,17 @@ try {
 
 const usersId = (await pb.collections.getOne('users')).id;
 
-// Fields added to the built-in `users` collection: whether the user wants a push
-// notification for new tasks, and their Pushover user key.
+// Fields added to the built-in `users` collection: which task events the user wants a
+// push notification for (new; completed or deleted; changed), and their Pushover key.
 const users = {
   name: 'users',
-  fields: [{ name: 'PushNotifications', type: 'bool' }, text('PushOverUser')],
+  fields: [
+    { name: 'PushTaskNew', type: 'bool' },
+    { name: 'PushTaskDone', type: 'bool' },
+    { name: 'PushTaskChanged', type: 'bool' },
+    { name: 'PushOnlyAssigned', type: 'bool' },
+    text('PushOverUser'),
+  ],
 };
 
 const taskLists = {
@@ -87,6 +93,8 @@ const tasks = (taskListsId) => ({
   fields: [
     relation('user', usersId),
     relation('taskListId', taskListsId),
+    // Who the task is assigned to; optional.
+    relation('assignee', usersId, false),
     text('title'),
     text('summary'),
     text('status'),
@@ -98,18 +106,18 @@ const tasks = (taskListsId) => ({
     text('createdBy'),
     text('editedBy'),
   ],
-  // Tasks inherit the visibility of the list they belong to; only the owner of
-  // that list may change them.
+  // Public lists are collaborative. The original task creator stays immutable,
+  // so only that user can delete the task.
   listRule: 'taskListId.visibility = "public" || taskListId.user = @request.auth.id',
   viewRule: 'taskListId.visibility = "public" || taskListId.user = @request.auth.id',
-  createRule: '@request.auth.id != "" && taskListId.user = @request.auth.id',
-  updateRule: 'taskListId.user = @request.auth.id',
-  deleteRule: 'taskListId.user = @request.auth.id',
+  createRule: '@request.auth.id != "" && (taskListId.visibility = "public" || taskListId.user = @request.auth.id) && user = @request.auth.id',
+  updateRule: '@request.auth.id != "" && (taskListId.visibility = "public" || taskListId.user = @request.auth.id) && @request.body.user:changed = false',
+  deleteRule: 'user = @request.auth.id',
 });
 
 /**
- * Creates the collection, or adds the fields an existing one is missing.
- * Existing fields and rules are left as they are. Returns its id.
+ * Creates the collection, or adds missing fields and synchronizes declared API rules.
+ * Existing fields are never removed. Returns the collection id.
  */
 async function create(collection) {
   try {
@@ -129,21 +137,30 @@ async function addMissingFields(collection) {
   const existing = await pb.collections.getOne(collection.name);
   const names = new Set(existing.fields.map((field) => field.name));
   const missing = collection.fields.filter((field) => !names.has(field.name));
-  if (missing.length === 0) {
+  const ruleNames = ['listRule', 'viewRule', 'createRule', 'updateRule', 'deleteRule'];
+  const changedRules = Object.fromEntries(
+    ruleNames
+      .filter((rule) => rule in collection && existing[rule] !== collection[rule])
+      .map((rule) => [rule, collection[rule]])
+  );
+  if (missing.length === 0 && Object.keys(changedRules).length === 0) {
     console.log(`skipped  ${collection.name} (already up to date)`);
     return existing.id;
   }
   try {
     await pb.collections.update(existing.id, {
-      fields: [...existing.fields, ...missing],
+      ...(missing.length ? { fields: [...existing.fields, ...missing] } : {}),
+      ...changedRules,
     });
   } catch (err) {
     console.error(`failed   ${collection.name}: ${err.message}`);
     process.exit(1);
   }
-  console.log(
-    `updated  ${collection.name} (added ${missing.map((f) => f.name).join(', ')})`
-  );
+  const changes = [
+    ...(missing.length ? [`added ${missing.map((field) => field.name).join(', ')}`] : []),
+    ...(Object.keys(changedRules).length ? ['updated API rules'] : []),
+  ];
+  console.log(`updated  ${collection.name} (${changes.join('; ')})`);
   return existing.id;
 }
 
