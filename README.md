@@ -51,12 +51,11 @@ node setup-collections.mjs <superuser-email> <superuser-password>
 ```
 
 It creates `task_lists` and `tasks` with the fields and API rules described below, and
-adds the two push notification fields to `users` (see
-[Push notifications for new tasks](#4-push-notifications-for-new-tasks)).
-Running it again is safe: an existing collection only gets the fields it is missing (for
-example after a field was added to the script); existing fields, rules and records are
-left untouched. To change or remove a field, use the Admin UI or start over with the
-delete script.
+adds the push notification fields to `users` (see
+[Push notifications about tasks](#4-push-notifications-about-tasks)).
+Running it again is safe: an existing collection gets any missing fields and its
+configured API rules are synchronized; existing fields and records are never removed.
+To change or remove a field, use the Admin UI or start over with the delete script.
 
 The same thing with plain HTTP calls, if you'd rather not run the script — first get a
 token, then post each collection. Relation fields need the **id** of the collection they
@@ -117,15 +116,19 @@ PocketBase ships with an auth collection named `users`. EasyTasks logs in agains
 **e-mail and password** (*Settings* page in the app). Make sure the identity/password
 auth method is enabled under *Collections → users → Options*.
 
-For push notifications, `users` gets two extra fields. The setup script adds them; in the
-Admin UI, add them under *Collections → users → Fields*:
+For push notifications, `users` gets four extra fields. The setup script adds them; in
+the Admin UI, add them under *Collections → users → Fields*:
 
-| Field               | Type       | Notes                                                    |
-| ------------------- | ---------- | -------------------------------------------------------- |
-| `PushNotifications` | Bool       | Ticked: the user is notified about new tasks.            |
-| `PushOverUser`      | Plain text | The user's Pushover user key. Empty: no notifications.   |
+| Field               | Type       | Notes                                                              |
+| ------------------- | ---------- | ------------------------------------------------------------------ |
+| `PushTaskNew` | Bool       | Ticked: the user is notified about new tasks.                      |
+| `PushTaskDone`      | Bool       | Ticked: … about completed tasks, and open tasks that were deleted. |
+| `PushTaskChanged`   | Bool       | Ticked: … about edited tasks.                                      |
+| `PushOnlyAssigned`  | Bool       | Ticked: … only about tasks assigned to this user (all tasks otherwise). |
+| `PushOverUser`      | Plain text | The user's Pushover user key. Empty: no notifications.             |
 
-The names are case-sensitive; the notification hook looks them up exactly like this.
+The names are case-sensitive; the notification hooks look them up exactly like this.
+Users set them themselves on the app's *Settings* page.
 
 Both other collections point at it: EasyTasks stores the id of the logged-in user as the
 owner of every list and task it creates. Without a login, EasyTasks stores its data in
@@ -208,32 +211,56 @@ possible because `taskListId` is a relation: rules can follow it with a dot.
 | Rule          | Expression                                                                   |
 | ------------- | ---------------------------------------------------------------------------- |
 | List / View   | `taskListId.visibility = "public" \|\| taskListId.user = @request.auth.id`    |
-| Create        | `@request.auth.id != "" && taskListId.user = @request.auth.id`                |
-| Update/Delete | `taskListId.user = @request.auth.id`                                         |
+| Create        | `@request.auth.id != "" && (taskListId.visibility = "public" || taskListId.user = @request.auth.id) && user = @request.auth.id` |
+| Update        | `@request.auth.id != "" && (taskListId.visibility = "public" || taskListId.user = @request.auth.id) && @request.body.user:changed = false` |
+| Delete        | `user = @request.auth.id`                                                    |
 
-So a public list is readable by everyone, but only its owner may add, change or delete
-its tasks. To let any logged-in user add tasks to a public list, widen Create to
-`@request.auth.id != "" && (taskListId.visibility = "public" || taskListId.user = @request.auth.id)`.
+Any logged-in user can add or change tasks in a public list. The update rule requires
+the task's creator relation to remain unchanged, so collaborators cannot take
+ownership; only the user who created a task may delete it. Private-list tasks remain
+visible and editable only by their list owner.
 
-## 4. Push notifications for new tasks
+## 4. Push notifications about tasks
 
-Optional. When a task is created, PocketBase itself sends a push notification through
-`https://push.cachat.ch/notify`, using a server-side hook — so the Pushover keys never
-reach the app, and tasks created in any way (app, Admin UI, API) are covered.
+Optional. When a task is created, completed, deleted or edited, PocketBase itself sends
+a push notification through `https://push.your-server.com:xxxx/notify`, using server-side hooks —
+so the Pushover keys never reach the app.
 
-Who is notified: every user with **`PushNotifications`** ticked and a
-**`PushOverUser`** key set, except the user who created the task. A task on a
-**private** list only goes to the list's owner — and since only the owner may add tasks
-to their lists, tasks on private lists notify nobody. Users sharing a key get one
-message, not several. The message reads, for example,
-`New task in "Shopping": Milk (by anna@example.com)`.
+Each user picks the events on the app's *Settings* page:
+
+| Event                       | Field               | Example message                                         |
+| --------------------------- | ------------------- | ------------------------------------------------------- |
+| New task                    | `PushTaskNew` | `New task in "Shopping": Milk (by anna@example.com)`     |
+| Task completed              | `PushTaskDone`      | `Task completed in "Shopping": Milk (by anna@example.com)` |
+| Open task deleted           | `PushTaskDone`      | `Task deleted in "Shopping": Milk (by anna@example.com)` |
+| Task edited                 | `PushTaskChanged`   | `Task changed in "Shopping": Milk (by anna@example.com)` |
+
+Who is notified: every user with the event's field ticked and a **`PushOverUser`** key
+set, except the user who caused the event. A task on a **private** list only goes to
+the list's owner — and since only the owner may change tasks on their lists, tasks on
+private lists notify nobody. Users sharing a key get one message, not several.
+
+A few details:
+
+- **Deleting a completed task** sends nothing: it was announced when it was completed.
+  This also keeps deleting a finished task list quiet, which removes its (all
+  completed) tasks first.
+- **An edit** only counts if the title, summary, status, due date, icon or list
+  changed. Saving the form unchanged sends nothing.
+- New tasks are noticed however they are created (app, Admin UI, API). Completions,
+  deletions and edits are noticed when made through the API — which includes the app
+  and the Admin UI — because only the API request tells who made them.
 
 **Setup:**
 
-1. Add the two fields to `users` (the setup script does this, see
-   [`users`](#1-users--already-there)), then set them per user in the Admin UI.
-2. Copy [`pb_hooks/notify_new_task.pb.js`](pb_hooks/notify_new_task.pb.js) into the
-   `pb_hooks` folder next to PocketBase's `pb_data` folder. With Docker, mount it:
+1. Add the fields to `users` (the setup script does this, see
+   [`users`](#1-users--already-there)).
+2. Copy [`pb_hooks/notify_tasks.pb.js`](pb_hooks/notify_tasks.pb.js) **and**
+   [`pb_hooks/push_notify.js`](pb_hooks/push_notify.js) into the `pb_hooks` folder next
+   to PocketBase's `pb_data` folder. The first holds the hooks, the second the code they
+   share. Also copy [`pb_hooks/users.pb.js`](pb_hooks/users.pb.js): it provides the user
+   list the app needs to assign tasks (`GET /api/easytasks/users`). With Docker, mount
+   the folder:
 
    ```yaml
    volumes:
@@ -244,7 +271,7 @@ message, not several. The message reads, for example,
    PocketBase looks for hooks in `pb_hooks` next to the data folder (`--dir`), so no
    extra option is needed.
 3. Restart PocketBase; with Docker, `docker compose up -d` (a plain `restart` does not
-   pick up a new volume). Later changes to the file are reloaded automatically.
+   pick up a new volume). Later changes to the files are reloaded automatically.
 
 A failed notification never stops the task from being saved. Failures are logged under
 *Logs* in the Admin UI (`push notify failed` / `push notify error`).
@@ -263,7 +290,8 @@ rules, mark `PushOverUser` as *Hidden* in the field options.
   sees all of its tasks; the `user` field on a task only records who created it.
 - **Cross-origin requests.** EasyTasks usually runs on a different address than
   PocketBase. PocketBase allows requests from any origin by default; if you restricted
-  that with the `--origins` option, add the address EasyTasks is served from.
+  that with the `--origins` option, add the address EasyTasks is served from. The
+  Android app sends its requests from `https://localhost`, so add that as well.
 
 ## 6. Check it
 
